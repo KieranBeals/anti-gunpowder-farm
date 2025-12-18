@@ -22,7 +22,7 @@ loom {
 	splitEnvironmentSourceSets()
 
 	mods {
-		"modid" {
+		"anti-gunpowder-farm" {
 			sourceSet sourceSets.main
 			sourceSet sourceSets.client
 		}
