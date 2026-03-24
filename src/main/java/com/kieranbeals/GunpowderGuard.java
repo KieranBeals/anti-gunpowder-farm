@@ -21,20 +21,16 @@ import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.AABB;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 public final class GunpowderGuard {
-
-    private static final Logger LOGGER = LoggerFactory.getLogger(
-        "anti-gunpowder-farm"
-    );
 
     private static final long COOLDOWN_MS = 60_000L;
 
     private static final int BUCKET_BLOCKS = 3;
     private static final int SCAN_RADIUS_BLOCKS = 2;
     private static final int SCAN_TICKS = 2;
+
+    private static final int  CLEANUP_ENTRY_THRESHOLD = 20_000;
+    private static final long CLEANUP_WINDOW_MS       = 10 * 60_000L;
 
     private static final Map<String, Long> LAST_AT_LOCATION_MS =
         new ConcurrentHashMap<>();
@@ -164,7 +160,7 @@ public final class GunpowderGuard {
                     // Only log if we actually removed something
                     if (!req.logged && req.removedGunpowder > 0) {
                         // one clean line, everything important
-                        LOGGER.info(
+                        AntiGunpowderFarm.LOGGER.info(
                             "[AntiGP] removedGunpowder={} mob={} pos={},{},{} dim={} reason={} killer={} cause={} key={} sinceMs={}",
                             req.removedGunpowder,
                             req.mobId,
@@ -209,7 +205,7 @@ public final class GunpowderGuard {
 
         Entity attacker = source.getEntity();
         if (attacker instanceof Player p && !p.isSpectator()) {
-            // FIX: GameProfile.name() instead of .getName()
+            // GameProfile.name() — .getName() was removed in MC 1.21
             return new KillInfo(p.getGameProfile().name(), cause);
         }
 
@@ -217,7 +213,7 @@ public final class GunpowderGuard {
         if (direct instanceof Projectile proj) {
             Entity owner = proj.getOwner();
             if (owner instanceof Player p && !p.isSpectator()) {
-                // FIX: GameProfile.name() instead of .getName()
+                // GameProfile.name() — .getName() was removed in MC 1.21
                 return new KillInfo(p.getGameProfile().name(), cause);
             }
         }
@@ -243,8 +239,8 @@ public final class GunpowderGuard {
     }
 
     private static void cleanupOldCooldowns(long nowMs) {
-        if (LAST_AT_LOCATION_MS.size() < 20000) return;
-        long cutoff = nowMs - (10 * 60_000L);
+        if (LAST_AT_LOCATION_MS.size() < CLEANUP_ENTRY_THRESHOLD) return;
+        long cutoff = nowMs - CLEANUP_WINDOW_MS;
         LAST_AT_LOCATION_MS.entrySet().removeIf(e -> e.getValue() < cutoff);
     }
 }

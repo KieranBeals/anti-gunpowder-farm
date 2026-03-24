@@ -3,11 +3,11 @@
   "id": "anti-gunpowder-farm",
   "version": "${version}",
   "name": "Anti Gunpowder Farm",
-  "description": "This is an example description! Tell everyone what your mod is about!",
+  "description": "Prevents automated gunpowder farming by blocking drops from Creepers, Ghasts, and Witches unless killed manually and not on cooldown.",
   "authors": ["Kieran Beals"],
   "contact": {
-    "homepage": "https://fabricmc.net/",
-    "sources": "https://github.com/FabricMC/fabric-example-mod"
+    "homepage": "https://github.com/kieranbeals/anti-gunpowder-farm",
+    "sources": "https://github.com/kieranbeals/anti-gunpowder-farm"
   },
   "license": "CC0-1.0",
   "icon": "assets/anti-gunpowder-farm/icon.png",
@@ -21,8 +21,5 @@
     "minecraft": "~1.21.11",
     "java": ">=21",
     "fabric-api": "*"
-  },
-  "suggests": {
-    "another-mod": "*"
   }
 }

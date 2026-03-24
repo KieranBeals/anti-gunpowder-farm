@@ -12,7 +12,6 @@ public class AntiGunpowderFarm implements ModInitializer {
     @Override
     public void onInitialize() {
         LOGGER.info("Anti Gunpowder Farm Initialized!");
-        // Register your event handler class
         GunpowderGuard.register();
     }
 }
