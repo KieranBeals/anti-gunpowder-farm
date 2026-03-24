@@ -1,186 +1,143 @@
 package com.kieranbeals;
 
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Queue;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
-import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Ghast;
 import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.projectile.Projectile;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
-import net.minecraft.world.phys.AABB;
+import net.minecraft.world.level.Level;
+
 public final class GunpowderGuard {
 
-    private static final long COOLDOWN_MS = 60_000L;
+    static final int  PLAYER_MAX_KILLS  = 50;
+    static final long PLAYER_RAMP_UP_MS = 15 * 60_000L;
+    static final int  CHUNK_MAX_KILLS   =  3;
+    static final long CHUNK_RAMP_UP_MS  =  5 * 60_000L;
 
-    private static final int BUCKET_BLOCKS = 3;
-    private static final int SCAN_RADIUS_BLOCKS = 2;
-    private static final int SCAN_TICKS = 2;
-
-    private static final int  CLEANUP_ENTRY_THRESHOLD = 20_000;
-    private static final long CLEANUP_WINDOW_MS       = 10 * 60_000L;
-
-    private static final Map<String, Long> LAST_AT_LOCATION_MS =
+    static final ConcurrentHashMap<UUID, TokenBucket> PLAYER_BUCKETS =
         new ConcurrentHashMap<>();
 
-    private static final Queue<ScanRequest> queue =
-        new ConcurrentLinkedQueue<>();
+    static final ConcurrentHashMap<ResourceKey<Level>, ConcurrentHashMap<Long, TokenBucket>> CHUNK_BUCKETS =
+        new ConcurrentHashMap<>();
 
-    private static final class ScanRequest {
+    static final class TokenBucket {
 
-        final ServerLevel level;
-        final BlockPos pos;
-        final long expireGameTime;
+        private final int    maxKills;
+        private final double refillRate;
+        private double tokens;
+        private long   lastUpdatedMs;
 
-        final String dimShort;
-        final String locationKey;
-        final String mobId;
-
-        final String killer; // player name or "none"
-        final String cause; // source.getMsgId()
-        final String blockReason; // "nonPlayer" | "cooldown" | "nonPlayer+cooldown"
-        final long sinceLastMs; // -1 if unknown
-
-        int removedGunpowder = 0;
-        boolean logged = false;
-
-        ScanRequest(
-            ServerLevel level,
-            BlockPos pos,
-            long expireGameTime,
-            String dimShort,
-            String locationKey,
-            String mobId,
-            String killer,
-            String cause,
-            String blockReason,
-            long sinceLastMs
-        ) {
-            this.level = level;
-            this.pos = pos;
-            this.expireGameTime = expireGameTime;
-            this.dimShort = dimShort;
-            this.locationKey = locationKey;
-            this.mobId = mobId;
-            this.killer = killer;
-            this.cause = cause;
-            this.blockReason = blockReason;
-            this.sinceLastMs = sinceLastMs;
+        TokenBucket(int maxKills, long rampUpMs, long nowMs) {
+            this.maxKills      = maxKills;
+            this.refillRate    = (double) maxKills / rampUpMs;
+            this.tokens        = maxKills;
+            this.lastUpdatedMs = nowMs;
         }
+
+        void refill(long nowMs) {
+            long elapsed = nowMs - lastUpdatedMs;
+            tokens        = Math.min(maxKills, tokens + elapsed * refillRate);
+            lastUpdatedMs = nowMs;
+        }
+
+        boolean isFull()    { return tokens >= maxKills; }
+        boolean hasToken()  { return tokens >= 1.0; }
+        void    consume()   { tokens -= 1.0; }
+        double  getTokens() { return tokens; }
     }
 
-    public static void register() {
-        ServerLivingEntityEvents.AFTER_DEATH.register(
-            (LivingEntity entity, DamageSource source) -> {
-                if (!(entity.level() instanceof ServerLevel level)) return;
-                if (!isGunpowderMob(entity)) return;
+    /**
+     * Called from the mixin before loot is dropped.
+     * Returns true to allow the loot table to run, false to cancel it.
+     */
+    public static boolean allowLootDrop(LivingEntity entity, ServerLevel level, DamageSource source) {
+        if (!isGunpowderMob(entity)) return true;
 
-                BlockPos pos = entity.blockPosition();
-                String key = locationKey(level, pos);
+        KillInfo ki    = killInfo(source);
+        BlockPos pos   = entity.blockPosition();
+        String   mobId = entity.getType().toString();
+        long     nowMs = System.currentTimeMillis();
 
-                long nowMs = System.currentTimeMillis();
-                Long last = LAST_AT_LOCATION_MS.get(key);
-                long sinceLast = last == null ? -1L : (nowMs - last);
-                boolean onCooldown = last != null && sinceLast < COOLDOWN_MS;
+        if (ki.killerUUID == null) {
+            log(level, pos, mobId, "none", ki.cause, "nonPlayer", -1.0, -1.0);
+            return false;
+        }
 
-                KillInfo ki = killInfo(source);
+        UUID   uuid = ki.killerUUID;
+        int    cx   = pos.getX() >> 4;
+        int    cz   = pos.getZ() >> 4;
+        long   ck   = chunkKey(cx, cz);
+        ResourceKey<Level> dim = level.dimension();
 
-                boolean playerKill = ki.killerPlayerName != null;
-                boolean blockGunpowder = !playerKill || onCooldown;
+        // --- Player bucket (absent = full) ---
+        TokenBucket pb = PLAYER_BUCKETS.get(uuid);
+        if (pb != null) {
+            pb.refill(nowMs);
+            if (pb.isFull()) { PLAYER_BUCKETS.remove(uuid); pb = null; }
+        }
+        boolean playerHasToken = pb == null || pb.hasToken();
+        double  playerTokens   = pb == null ? PLAYER_MAX_KILLS : pb.getTokens();
 
-                // Always update timestamp (even if blocked / even if nothing drops)
-                LAST_AT_LOCATION_MS.put(key, nowMs);
+        // --- Chunk bucket (absent = full) ---
+        ConcurrentHashMap<Long, TokenBucket> chunkMap =
+            CHUNK_BUCKETS.computeIfAbsent(dim, k -> new ConcurrentHashMap<>());
+        TokenBucket cb = chunkMap.get(ck);
+        if (cb != null) {
+            cb.refill(nowMs);
+            if (cb.isFull()) { chunkMap.remove(ck); cb = null; }
+        }
+        boolean chunkHasToken = cb == null || cb.hasToken();
+        double  chunkTokens   = cb == null ? CHUNK_MAX_KILLS : cb.getTokens();
 
-                if (!blockGunpowder) return;
-
-                String reason;
-                if (!playerKill && onCooldown) reason = "nonPlayer+cooldown";
-                else if (!playerKill) reason = "nonPlayer";
-                else reason = "cooldown";
-
-                long nowTick = level.getGameTime();
-                queue.add(
-                    new ScanRequest(
-                        level,
-                        pos,
-                        nowTick + SCAN_TICKS,
-                        shortDim(level),
-                        key,
-                        entity.getType().toString(),
-                        playerKill ? ki.killerPlayerName : "none",
-                        ki.cause,
-                        reason,
-                        sinceLast
-                    )
-                );
-
-                cleanupOldCooldowns(nowMs);
+        // --- Decision ---
+        if (playerHasToken && chunkHasToken) {
+            if (pb == null) {
+                pb = new TokenBucket(PLAYER_MAX_KILLS, PLAYER_RAMP_UP_MS, nowMs);
+                pb.consume();
+                PLAYER_BUCKETS.put(uuid, pb);
+            } else {
+                pb.consume();
             }
+            if (cb == null) {
+                cb = new TokenBucket(CHUNK_MAX_KILLS, CHUNK_RAMP_UP_MS, nowMs);
+                cb.consume();
+                chunkMap.put(ck, cb);
+            } else {
+                cb.consume();
+            }
+            return true;
+        }
+
+        String reason;
+        if (!playerHasToken && !chunkHasToken) reason = "bothRateLimit";
+        else if (!playerHasToken)               reason = "playerRateLimit";
+        else                                    reason = "chunkRateLimit";
+
+        log(level, pos, mobId, ki.killerPlayerName, ki.cause, reason, playerTokens, chunkTokens);
+        return false;
+    }
+
+    private static void log(
+        ServerLevel level, BlockPos pos,
+        String mobId, String killer, String cause,
+        String reason, double playerTokens, double chunkTokens
+    ) {
+        AntiGunpowderFarm.LOGGER.info(
+            "[AntiGP] blocked mob={} pos={},{},{} dim={} reason={} killer={} cause={} playerTokens={} chunkTokens={}",
+            mobId,
+            pos.getX(), pos.getY(), pos.getZ(),
+            shortDim(level),
+            reason, killer, cause,
+            playerTokens, chunkTokens
         );
-
-        ServerTickEvents.END_SERVER_TICK.register(server -> {
-            Iterator<ScanRequest> it = queue.iterator();
-            while (it.hasNext()) {
-                ScanRequest req = it.next();
-
-                if (req.level.getServer() != server) {
-                    it.remove();
-                    continue;
-                }
-
-                long nowTick = req.level.getGameTime();
-
-                AABB box = new AABB(req.pos).inflate(SCAN_RADIUS_BLOCKS);
-                for (ItemEntity itemEntity : req.level.getEntitiesOfClass(
-                    ItemEntity.class,
-                    box
-                )) {
-                    ItemStack stack = itemEntity.getItem();
-                    if (stack.isEmpty()) continue;
-
-                    if (stack.getItem() == Items.GUNPOWDER) {
-                        req.removedGunpowder += stack.getCount();
-                        itemEntity.discard(); // delete the dropped gunpowder
-                    }
-                }
-
-                if (nowTick >= req.expireGameTime) {
-                    // Only log if we actually removed something
-                    if (!req.logged && req.removedGunpowder > 0) {
-                        // one clean line, everything important
-                        AntiGunpowderFarm.LOGGER.info(
-                            "[AntiGP] removedGunpowder={} mob={} pos={},{},{} dim={} reason={} killer={} cause={} key={} sinceMs={}",
-                            req.removedGunpowder,
-                            req.mobId,
-                            req.pos.getX(),
-                            req.pos.getY(),
-                            req.pos.getZ(),
-                            req.dimShort,
-                            req.blockReason,
-                            req.killer,
-                            req.cause,
-                            req.locationKey,
-                            req.sinceLastMs
-                        );
-                        req.logged = true;
-                    }
-
-                    it.remove();
-                }
-            }
-        });
     }
 
     private static boolean isGunpowderMob(LivingEntity e) {
@@ -189,58 +146,50 @@ public final class GunpowderGuard {
 
     private static final class KillInfo {
 
-        final String killerPlayerName; // null if not player
-        final String cause; // source msgId, e.g. "player", "drown", "fall"
+        final UUID   killerUUID;
+        final String killerPlayerName;
+        final String cause;
 
-        KillInfo(String killerPlayerName, String cause) {
+        KillInfo(UUID killerUUID, String killerPlayerName, String cause) {
+            this.killerUUID       = killerUUID;
             this.killerPlayerName = killerPlayerName;
-            this.cause = cause;
+            this.cause            = cause;
         }
     }
 
     private static KillInfo killInfo(DamageSource source) {
-        if (source == null) return new KillInfo(null, "unknown");
+        if (source == null) return new KillInfo(null, null, "unknown");
 
         String cause = source.getMsgId();
 
         Entity attacker = source.getEntity();
         if (attacker instanceof Player p && !p.isSpectator()) {
-            // GameProfile.name() — .getName() was removed in MC 1.21
-            return new KillInfo(p.getGameProfile().name(), cause);
+            return new KillInfo(p.getUUID(), p.getGameProfile().name(), cause);
         }
 
         Entity direct = source.getDirectEntity();
         if (direct instanceof Projectile proj) {
             Entity owner = proj.getOwner();
             if (owner instanceof Player p && !p.isSpectator()) {
-                // GameProfile.name() — .getName() was removed in MC 1.21
-                return new KillInfo(p.getGameProfile().name(), cause);
+                return new KillInfo(p.getUUID(), p.getGameProfile().name(), cause);
             }
         }
 
-        return new KillInfo(null, cause);
+        return new KillInfo(null, null, cause);
     }
 
-    private static String locationKey(ServerLevel level, BlockPos pos) {
-        int bx = Math.floorDiv(pos.getX(), BUCKET_BLOCKS);
-        int bz = Math.floorDiv(pos.getZ(), BUCKET_BLOCKS);
-        return shortDim(level) + ":" + bx + ":" + bz;
+    private static long chunkKey(int cx, int cz) {
+        return ((long) cx << 32) | (cz & 0xFFFFFFFFL);
     }
 
     private static String shortDim(ServerLevel level) {
         String raw = level.dimension().toString();
-        int idx = raw.lastIndexOf(" / ");
+        int    idx = raw.lastIndexOf(" / ");
         if (idx != -1) {
             String tail = raw.substring(idx + 3);
             if (tail.endsWith("]")) tail = tail.substring(0, tail.length() - 1);
             return tail;
         }
         return raw;
-    }
-
-    private static void cleanupOldCooldowns(long nowMs) {
-        if (LAST_AT_LOCATION_MS.size() < CLEANUP_ENTRY_THRESHOLD) return;
-        long cutoff = nowMs - CLEANUP_WINDOW_MS;
-        LAST_AT_LOCATION_MS.entrySet().removeIf(e -> e.getValue() < cutoff);
     }
 }
